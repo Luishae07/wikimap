@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Wikipedia on the map</title>
+<meta name="description" content="Every Wikipedia article near any place, as pins on a map. Click one to read it, or press Surprise me.">
+<link rel="stylesheet" href="vendor/leaflet.css">
+<style>
+:root{--bg:#0e1628;--card:#17203a;--line:#2a3558;--text:#ecf0ff;--dim:#9aa1c2;--accent:#7c8cff;--pin:#ff7a59}
+@media (prefers-color-scheme: light){:root{--bg:#f4f6fc;--card:#ffffff;--line:#d9deef;--text:#151a2e;--dim:#5b6384;--accent:#4f5fe0;--pin:#e0552f}}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;gap:8px;align-items:center;padding:10px 12px;background:var(--card);border-bottom:1px solid var(--line);flex-wrap:wrap;z-index:1000}
+header h1{font-size:17px;margin:0 6px 0 0;white-space:nowrap}
+header input,header select,header button{font:inherit;padding:8px 11px;border-radius:9px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+header input{flex:1;min-width:140px}
+header button{cursor:pointer;background:var(--accent);color:#0b1020;border:0;font-weight:600}
+header button.alt{background:var(--bg);color:var(--text);border:1px solid var(--line)}
+#wrap{flex:1;display:flex;min-height:0}
+#map{flex:1;background:#222}
+#side{width:340px;max-width:44vw;overflow-y:auto;background:var(--card);border-left:1px solid var(--line)}
+#hint{padding:10px 14px;color:var(--dim);font-size:13px;border-bottom:1px solid var(--line)}
+#list a{display:block;padding:9px 14px;color:var(--text);text-decoration:none;border-bottom:1px solid var(--line);cursor:pointer}
+#list a:hover{background:var(--bg)}#list small{display:block;color:var(--dim)}
+#article{padding:14px}#article img{width:100%;max-height:200px;object-fit:cover;border-radius:10px;margin-bottom:10px}
+#article h2{margin:0 0 6px;font-size:20px}#article p{margin:0 0 10px}
+#article a.read{display:inline-block;padding:8px 14px;border-radius:9px;background:var(--accent);color:#0b1020;text-decoration:none;font-weight:600}
+#article .back{background:none;border:0;color:var(--accent);cursor:pointer;padding:0 0 8px;font:inherit}
+.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:var(--card);color:var(--text)}
+.leaflet-popup-content a{color:var(--accent)}
+@media (max-width:760px){#wrap{flex-direction:column}#side{width:100%;max-width:none;height:38%;border-left:0;border-top:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>🌍 Wikipedia on the map</h1>
+  <input id="q" placeholder="Go to a place, e.g. Prague" autocomplete="off">
+  <button id="go">Go</button>
+  <button class="alt" id="here" title="Use my location">📍 Near me</button>
+  <button class="alt" id="rand">🎲 Surprise me</button>
+  <select id="lang" aria-label="Wikipedia language">
+    <option value="en">English</option><option value="de">Deutsch</option><option value="fr">Français</option>
+    <option value="es">Español</option><option value="it">Italiano</option><option value="nl">Nederlands</option>
+    <option value="pl">Polski</option><option value="pt">Português</option><option value="ru">Русский</option>
+    <option value="ja">日本語</option><option value="zh">中文</option>
+  </select>
+</header>
+<div id="wrap">
+  <div id="map"></div>
+  <aside id="side"><div id="hint">Zoom in to see articles.</div><div id="list"></div><div id="article" hidden></div></aside>
+</div>
+<script src="vendor/leaflet.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
+
+// ---- state ----
+let lang = store("lang") || (navigator.language || "en").slice(0, 2);
+if (![...$("lang").options].some(o => o.value === lang)) lang = "en";
+$("lang").value = lang;
+let start = [50.08, 14.43], startZoom = 13;                       // Prague
+try { const v = JSON.parse(store("view") || "null"); if (v) { start = [v.lat, v.lon]; startZoom = v.z; } } catch (e) {}
+
+const map = L.map("map", { zoomControl: true }).setView(start, startZoom);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · articles © <a href="https://www.wikipedia.org">Wikipedia</a> (CC BY-SA)'
+}).addTo(map);
+const pins = L.layerGroup().addTo(map);
+let loadId = 0, current = [];
+
+// ---- articles near the middle of the view ----
+async function load() {
+  const my = ++loadId, c = map.getCenter(), z = map.getZoom();
+  store("view", JSON.stringify({ lat: c.lat, lon: c.lng, z }));
+  if (z < 11) { pins.clearLayers(); current = []; $("list").innerHTML = ""; $("hint").textContent = "Zoom in a little to see articles (they load from zoom level 11)."; return; }
+  const b = map.getBounds(), radius = Math.min(10000, Math.max(300, Math.round(c.distanceTo(b.getNorthEast()))));
+  const url = `https://${lang}.wikipedia.org/w/api.php?action=query&list=geosearch&gscoord=${c.lat}|${c.lng}&gsradius=${radius}&gslimit=200&format=json&origin=*`;
+  $("hint").textContent = "Loading articles…";
+  try {
+    const r = await fetch(url);
+    const d = await r.json();
+    if (my !== loadId) return;                                   // the map moved again: ignore this answer
+    current = (d.query && d.query.geosearch) || [];
+    pins.clearLayers();
+    for (const a of current) {
+      L.circleMarker([a.lat, a.lon], { radius: 7, color: "#fff", weight: 1.5, fillColor: getComputedStyle(document.documentElement).getPropertyValue("--pin").trim() || "#ff7a59", fillOpacity: 0.95 })
+        .on("click", () => openArticle(a.title, false))
+        .bindTooltip(esc(a.title), { direction: "top" })
+        .addTo(pins);
+    }
+    $("hint").textContent = current.length ? `${current.length} articles here. Click a pin or a title.` : "No Wikipedia articles with a location here. Try moving the map.";
+    $("list").innerHTML = current.slice().sort((x, y) => x.dist - y.dist).slice(0, 60)
+      .map(a => `<a data-t="${esc(a.title)}">${esc(a.title)}<small>${a.dist < 1000 ? Math.round(a.dist) + " m" : (a.dist / 1000).toFixed(1) + " km"} from the middle</small></a>`).join("");
+  } catch (e) {
+    if (my === loadId) $("hint").textContent = "Could not reach Wikipedia right now.";
+  }
+}
+let timer = null;
+map.on("moveend", () => { clearTimeout(timer); timer = setTimeout(load, 500); });
+
+// ---- one article ----
+async function openArticle(title, fly) {
+  $("list").hidden = true; $("article").hidden = false; $("hint").textContent = "";
+  $("article").innerHTML = `<button class="back">← back to the list</button><p class="dim">Loading…</p>`;
+  $("article").querySelector(".back").onclick = back;
+  try {
+    const r = await fetch(`https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title.replace(/ /g, "_"))}`);
+    const d = await r.json();
+    if (fly && d.coordinates) map.setView([d.coordinates.lat, d.coordinates.lon], Math.max(map.getZoom(), 14));
+    $("article").innerHTML = `<button class="back">← back to the list</button>` +
+      (d.thumbnail ? `<img src="${esc(d.thumbnail.source)}" alt="">` : "") +
+      `<h2>${esc(d.title || title)}</h2>` + (d.description ? `<p style="color:var(--dim)">${esc(d.description)}</p>` : "") +
+      `<p>${esc(d.extract || "No summary available.")}</p>` +
+      (d.content_urls ? `<a class="read" target="_blank" rel="noopener" href="${esc(d.content_urls.desktop.page)}">Read on Wikipedia →</a>` : "");
+    $("article").querySelector(".back").onclick = back;
+  } catch (e) {
+    $("article").innerHTML = `<button class="back">← back</button><p>Could not load this article.</p>`;
+    $("article").querySelector(".back").onclick = back;
+  }
+}
+function back() { $("article").hidden = true; $("list").hidden = false; load(); }
+$("list").addEventListener("click", e => { const a = e.target.closest("a[data-t]"); if (a) openArticle(a.dataset.t, true); });
+
+// ---- controls ----
+async function goTo(text) {
+  if (!text.trim()) return;
+  try {
+    const r = await fetch("https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" + encodeURIComponent(text));
+    const d = await r.json();
+    if (!d.length) { $("hint").textContent = "Could not find that place."; return; }
+    map.setView([+d[0].lat, +d[0].lon], 14);
+  } catch (e) { $("hint").textContent = "Search is not available right now."; }
+}
+$("go").onclick = () => goTo($("q").value);
+$("q").addEventListener("keydown", e => { if (e.key === "Enter") goTo($("q").value); });
+$("here").onclick = () => {
+  if (!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(p => map.setView([p.coords.latitude, p.coords.longitude], 15),
+    () => { $("hint").textContent = "Could not get your location."; }, { timeout: 15000 });
+};
+$("lang").onchange = () => { lang = $("lang").value; store("lang", lang); back(); };
+
+// a random article that has a position: ask for a batch of random articles with coordinates
+$("rand").onclick = async () => {
+  $("hint").textContent = "Finding a surprise…";
+  for (let i = 0; i < 8; i++) {
+    try {
+      const r = await fetch(`https://${lang}.wikipedia.org/w/api.php?action=query&generator=random&grnnamespace=0&grnlimit=500&prop=coordinates&colimit=500&format=json&origin=*`);
+      const pages = Object.values(((await r.json()).query || {}).pages || {}).filter(p => p.coordinates && p.coordinates[0]);
+      if (pages.length) {
+        const p = pages[Math.floor(Math.random() * pages.length)];
+        map.setView([p.coordinates[0].lat, p.coordinates[0].lon], 15);
+        openArticle(p.title, false);
+        return;
+      }
+    } catch (e) { break; }
+  }
+  $("hint").textContent = "No luck this time. Press it again.";
+};
+
+load();
+</script>
+</body></html>
